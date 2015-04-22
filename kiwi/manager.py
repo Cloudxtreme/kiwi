@@ -3,18 +3,20 @@ import uuid
 import time
 import logging
 import netaddr
-
+import threading
 import Queue
 
 from exc import *
 import defaults
+import addresswatcher
+import servicewatcher
 
 
 LOG = logging.getLogger(__name__)
 
 
 class Manager (object):
-    def __init__(self, mqueue,
+    def __init__(self,
                  id=None,
                  kube_endpoint=defaults.kube_endpoint,
                  etcd_endpoint=defaults.etcd_endpoint,
@@ -43,11 +45,42 @@ class Manager (object):
             self.cidr_ranges = [netaddr.IPNetwork(n)
                                 for n in cidr_ranges]
 
-        self.q = mqueue
         self.addresses = {}
 
+        self.q = Queue.Queue()
+
     def run(self):
+        try:
+            self.mainloop()
+        finally:
+            self.cleanup()
+
+    def watch_addresses(self):
+        '''Read address events and stuff them into the queue.'''
+        watcher = addresswatcher.AddressWatcher(
+            etcd_endpoint=self.etcd_endpoint,
+            etcd_prefix=self.etcd_prefix)
+
+        for event in watcher:
+            self.q.put(event)
+
+    def watch_services(self):
+        '''Read service events and stuff them into the queue.'''
+        watcher = servicewatcher.ServiceWatcher(
+            kube_endpoint=self.kube_endpoint)
+
+        for event in watcher:
+            LOG.debug('event:', event)
+            self.q.put(event)
+
+    def mainloop(self):
         last_refresh = 0
+
+        # start worker threads to feed the event queue
+        [thread.start() for thread in [
+            threading.Thread(target=self.watch_services),
+            threading.Thread(target=self.watch_addresses),
+        ]]
 
         while True:
             try:
@@ -62,6 +95,7 @@ class Manager (object):
                           msg['message'],
                           msg['target'])
             except Queue.Empty:
+                LOG.debug('Punt!')
                 pass
 
             now = time.time()
@@ -69,10 +103,10 @@ class Manager (object):
                 self.refresh()
                 last_refresh = now
 
-    def handle_msg(self, msg):
-        handler = getattr(
-            self,
-            'handle_%s' % msg['message'].replace('-', '_'))
+    def handle_message(self, msg):
+        attr = 'handle_%s' % msg['message'].replace('-', '_')
+        LOG.debug('looking for %s', attr)
+        handler = getattr(self, attr)
 
         handler(msg)
 
@@ -106,16 +140,16 @@ class Manager (object):
                              params={'prevValue': self.id,
                                      'ttl': self.refresh_interval * 2},
                              data={'value': self.id})
-        except requests.ConnectionError as exc:
-            LOG.error('connection to %s failed: %s',
-                      self.url_for(address),
-                      exc)
-        else:
-            if not r.ok:
-                LOG.error('failed to refresh claim on %s: %s',
-                          address,
-                          r.reason)
-                self.release_address(address)
+            r.raise_for_status()
+
+            if self.iface_driver:
+                self.iface_driver.refresh_address(
+                    address,
+                    lft=self.refresh_interval*2)
+        except Exception as exc:
+            LOG.error('failed to refresh address %s: %s',
+                      address, exc)
+            self.release_address(address)
 
     def claim_address(self, address):
         assert address in self.addresses
@@ -144,10 +178,11 @@ class Manager (object):
 
             if self.iface_driver:
                 try:
-                    self.iface_driver.add_address(address)
+                    self.iface_driver.add_address(address,
+                                                  lft=self.refresh_interval*2)
                 except InterfaceDriverError as exc:
                     LOG.error('failed to configure address on system: %d',
-                              exc.status.returncode)
+                              exc.returncode)
 
     def release_address(self, address):
         if not self.address_is_claimed(address):
@@ -177,7 +212,7 @@ class Manager (object):
                 self.iface_driver.remove_address(address)
             except InterfaceDriverError as exc:
                 LOG.error('failed to remove address on system: %d',
-                          exc.status.returncode)
+                          exc.returncode)
 
     def remove_address(self, address):
         assert address in self.addresses
